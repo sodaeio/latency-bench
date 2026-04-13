@@ -1,0 +1,297 @@
+syntax = "proto3";
+
+package soda.stream;
+
+// ============================================================================
+// SodaHQ Streaming API v2
+//
+// Unified real-time stream for Solana DEX data.
+// Every event carries the full picture: trade + market state + identity.
+// ============================================================================
+
+service SodaStreamService {
+
+  /// Primary unified stream — trades, market updates, candles, pool creation.
+  /// Every trade event includes the full market snapshot (volume, reserves, etc.)
+  rpc Subscribe(SubscribeRequest) returns (stream TokenEvent);
+
+  /// Candle-specific stream with resolution filtering.
+  rpc SubscribeCandles(CandleSubscribeRequest) returns (stream TokenEvent);
+
+  // ── Legacy RPCs (kept for backward compatibility) ────────────────────
+  rpc SubscribeTransactions(SubscribeRequest) returns (stream TokenEvent);
+  rpc SubscribeMarketData(SubscribeRequest) returns (stream TokenEvent);
+  rpc SubscribeAll(SubscribeRequest) returns (stream TokenEvent);
+
+  /// Transaction tags stream — wallet classification (dev, sniper, bundler, etc.)
+  rpc SubscribeTransactionTags(SubscribeRequest) returns (stream TransactionTagEvent);
+}
+
+// ============================================================================
+// Subscription Requests
+// ============================================================================
+
+message SubscribeRequest {
+  /// Filter by DEX protocols (empty = all)
+  repeated DexProtocol dex_protocols    = 1;
+  /// Filter by on-chain program IDs (empty = all)
+  repeated string      program_ids      = 2;
+  /// Filter by token mint addresses (empty = all)
+  repeated string      token_addresses  = 3;
+  /// Filter by pool addresses (empty = all)
+  repeated string      pool_addresses   = 4;
+  /// Filter by event types (empty = all)
+  repeated EventType   event_types      = 5;
+}
+
+message CandleSubscribeRequest {
+  repeated string           token_addresses = 1;
+  repeated string           pool_addresses  = 2;
+  repeated CandleResolution resolutions     = 3;
+}
+
+// ============================================================================
+// TokenEvent — The unified event message
+//
+// Every event carries:
+//   1. Identity (token, pool, DEX — always present)
+//   2. Current price (always present)
+//   3. Event-specific data (trade, candle, or token creation)
+//   4. Full market snapshot (volume, reserves, fees — always present on trades)
+// ============================================================================
+
+message TokenEvent {
+  /// What kind of event this is
+  EventType             event_type      = 1;
+  /// Event timestamp (ms since epoch)
+  int64                 timestamp       = 2;
+
+  // ── Token Identity ───────────────────────────────────────────────────
+  string                base_address    = 3;   // Token mint (base58)
+  string                base_symbol     = 4;   // "BONK"
+  string                base_name       = 5;   // "Bonk"
+
+  string                quote_address   = 6;   // Quote mint (SOL/USDC)
+  string                quote_symbol    = 7;   // "SOL"
+
+  // ── Pool Identity ────────────────────────────────────────────────────
+  string                pool_address    = 8;   // Pool account (base58)
+  string                dex             = 9;   // "RaydiumClmm"
+  string                pair_label      = 10;  // "BONK/SOL"
+
+  // ── Price & Market Cap (in quote currency) ────────────────────────────
+  double                price           = 11;  // Quote per base (e.g., 0.0000062 SOL/BONK)
+  double                market_cap      = 12;  // Price × total supply (in quote currency)
+
+  // ── Trade Data (present when event_type is TRADE/BUY/SELL) ───────────
+  TradeData             trade           = 20;
+
+  // ── Market Snapshot (present on every TRADE event) ───────────────────
+  MarketSnapshot        market          = 30;
+
+  // ── Candle Data (present when event_type is CANDLE) ──────────────────
+  CandleData            candle          = 40;
+
+  // ── Token Metadata (present when event_type is CREATE_POOL/CREATE_TOKEN)
+  TokenMetadata         token_meta      = 50;
+}
+
+// ============================================================================
+// Trade Data — Per-transaction details
+// ============================================================================
+
+message TradeData {
+  string                tx_hash         = 1;   // Transaction signature (base58)
+  string                maker           = 2;   // Wallet address (base58)
+  Direction             direction       = 3;   // BUY, SELL, ADD_LIQUIDITY, etc.
+  double                base_amount     = 4;   // Tokens traded
+  double                quote_amount    = 5;   // Quote currency amount (SOL/USDC)
+  double                fee_lamports    = 6;   // Transaction fee (lamports)
+  uint64                slot            = 7;   // Solana slot number
+  double                quote_reserve   = 8;   // Pool quote reserve after trade
+  double                base_reserve    = 9;   // Pool base reserve after trade
+
+  /// Token creation metadata (only for CREATE_POOL/CREATE_TOKEN events)
+  TokenMetadata         create_meta     = 15;
+}
+
+// ============================================================================
+// Market Snapshot — Full market state for the pool
+//
+// Included with every trade event. Gives subscribers the complete picture
+// without needing a separate market data subscription.
+// ============================================================================
+
+message MarketSnapshot {
+  // ── Liquidity (in quote currency) ─────────────────────────────────────
+  double                quote_reserve       = 1;
+  double                base_reserve        = 2;
+  double                bonding_progress    = 3;   // 0-100 for bonding curve tokens
+
+  // ── Volume by Timeframe ──────────────────────────────────────────────
+  VolumeData            volume_one_min      = 10;
+  VolumeData            volume_five_min     = 11;
+  VolumeData            volume_thirty_min   = 12;
+  VolumeData            volume_one_hour     = 13;
+  VolumeData            volume_six_hour     = 14;
+  VolumeData            volume_one_day      = 15;
+
+  // ── Aggregate Totals ─────────────────────────────────────────────────
+  double                total_volume        = 30;
+  double                total_fees          = 31;
+  int32                 total_buys          = 32;
+  int32                 total_sells         = 33;
+
+  // ── Token Status ─────────────────────────────────────────────────────
+  bool                  is_graduated        = 40;
+  int64                 graduated_at        = 41;
+  string                creator_address     = 42;  // base58
+  bool                  dev_sold            = 43;
+  int64                 created_at          = 44;
+
+  // ── Creator Stats ────────────────────────────────────────────────────
+  int64                 creator_total_tokens     = 50;
+  int64                 creator_graduated_tokens = 51;
+}
+
+// ============================================================================
+// Volume Data — Nested per-timeframe volume metrics
+// ============================================================================
+
+message VolumeData {
+  double                buy             = 1;   // Buy volume (quote currency)
+  double                sell            = 2;   // Sell volume (quote currency)
+  double                total           = 3;   // Total volume
+  double                net             = 4;   // Buy - Sell
+  double                change_percent  = 5;   // Volume change vs previous period
+  int32                 buy_count       = 6;   // Number of buy transactions
+  int32                 sell_count      = 7;   // Number of sell transactions
+  double                fees            = 8;   // LP fees collected
+}
+
+// ============================================================================
+// Candle Data — OHLCV
+// ============================================================================
+
+message CandleData {
+  int64                 timestamp       = 1;   // Candle open time (ms)
+  double                open            = 2;
+  double                high            = 3;
+  double                low             = 4;
+  double                close           = 5;
+  double                volume          = 6;   // Volume in quote currency
+  CandleResolution      resolution      = 7;
+}
+
+// ============================================================================
+// Token Metadata — For new token/pool creation events
+// ============================================================================
+
+message TokenMetadata {
+  string                name            = 1;
+  string                symbol          = 2;
+  uint32                decimals        = 3;
+  string                image_uri       = 4;
+  string                description     = 5;
+  bool                  is_mayhem_mode  = 6;
+  bool                  is_cashback_enabled = 7;
+}
+
+// ============================================================================
+// Transaction Tag — Wallet classification
+// ============================================================================
+
+message TransactionTagEvent {
+  string                tx_hash         = 1;   // base58
+  string                maker           = 2;   // base58
+  string                pool_address    = 3;   // base58
+  string                base_address    = 4;   // base58
+  uint32                tags            = 5;   // Bitfield: bit0=bundler, bit1=first_buy, bit2=dev, bit3=sniper
+  int64                 timestamp       = 6;
+}
+
+// ============================================================================
+// Enums
+// ============================================================================
+
+enum EventType {
+  TRADE             = 0;
+  MARKET_UPDATE     = 1;
+  CANDLE            = 2;
+  CREATE_POOL       = 3;
+  CREATE_TOKEN      = 4;
+  ADD_LIQUIDITY     = 5;
+  REMOVE_LIQUIDITY  = 6;
+}
+
+enum Direction {
+  BUY               = 0;
+  SELL              = 1;
+  TRANSFER          = 2;
+  UNKNOWN           = 3;
+}
+
+enum CandleResolution {
+  RESOLUTION_1S     = 0;
+  RESOLUTION_1M     = 1;
+  RESOLUTION_5M     = 2;
+  RESOLUTION_15M    = 3;
+  RESOLUTION_1H     = 4;
+  RESOLUTION_4H     = 5;
+  RESOLUTION_1D     = 6;
+  RESOLUTION_1W     = 7;
+}
+
+enum DexProtocol {
+  RAYDIUM_AMM           = 0;
+  RAYDIUM_CPMM          = 1;
+  RAYDIUM_LAUNCHPAD     = 2;
+  PUMP_FUN              = 3;
+  PUMP_AMM              = 4;
+  DYNAMIC_BONDING_CURVE = 5;
+  DYNAMIC_AMM           = 6;
+  DYNAMIC_AMM_V2        = 7;
+  HEAVEN_AMM            = 8;
+  MASTER_MIND           = 9;
+  MOONIT                = 10;
+  BAGS                  = 11;
+  BONK                  = 12;
+  MOONSHOT              = 13;
+  BELIEVE               = 14;
+  JUPITER_STUDIO        = 15;
+  RAYDIUM_CLMM          = 16;
+  METEORA_DLMM          = 17;
+  BONKERS               = 18;
+  MAYHEM                = 19;
+  BOOP                  = 20;
+  VIRTUALS              = 21;
+  WHIRLPOOL             = 22;
+  PHOENIX_V1            = 23;
+  JUPITER               = 24;
+  DRIFT_V2              = 25;
+  MARGINFI_V2           = 26;
+  KAMINO_LENDING        = 27;
+  KAMINO_YVAULTS        = 28;
+  JUPITER_DCA           = 29;
+  JUPITER_LIMIT_ORDER   = 30;
+  JUPITER_PERPS         = 31;
+  OBRIC_V2              = 32;
+  ZEROFI                = 33;
+  SOLFI_V2              = 34;
+  TESSERA               = 35;
+  GOONFI_V2             = 36;
+  HUMIDIFI              = 37;
+  ALPHA_Q               = 38;
+  BISONFI               = 39;
+  STABBLE               = 40;
+  METEORA_ALPHA_VAULT   = 41;
+  METEORA_ZAP           = 42;
+}
+
+enum WalletTag {
+  TAG_USER         = 0;
+  TAG_DEVELOPER    = 1;
+  TAG_BUNDLER      = 2;
+  TAG_INSIDER      = 3;
+  TAG_SNIPER       = 4;
+}
