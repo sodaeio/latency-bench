@@ -80,7 +80,6 @@ enum EndpointKind {
     Quic,
     Soda,
     SodaWs,
-    SodaTcp,
 }
 
 struct EndpointConfig {
@@ -92,7 +91,6 @@ struct EndpointConfig {
 type SigMap = Arc<Mutex<HashMap<String, Vec<(usize, Instant)>>>>;
 
 const SUFFIX_MAP: &[(&str, EndpointKind)] = &[
-    (":sodatcp", EndpointKind::SodaTcp),
     (":sodaws", EndpointKind::SodaWs),
     (":soda", EndpointKind::Soda),
     (":shredstream", EndpointKind::Shredstream),
@@ -173,9 +171,6 @@ async fn main() -> Result<()> {
                         }
                         EndpointKind::SodaWs => {
                             run_soda_ws(idx, name, url, account, target, num_endpoints, sig_map, seen, done, shutdown_tx, shutdown_rx).await;
-                        }
-                        EndpointKind::SodaTcp => {
-                            run_soda_tcp(idx, name, url, target, num_endpoints, sig_map, seen, done, shutdown_tx, shutdown_rx).await;
                         }
                     }
                 });
@@ -1036,80 +1031,6 @@ async fn run_soda_ws(
                     Some(Ok(_)) => {}
                     Some(Err(e)) => { eprintln!("[{name}] WS error: {e}"); return; }
                     None => { eprintln!("[{name}] WS closed"); return; }
-                }
-            }
-            _ = shutdown_rx.recv() => return,
-        }
-    }
-}
-
-async fn run_soda_tcp(
-    idx: usize,
-    name: String,
-    url: String,
-    target: usize,
-    num_endpoints: usize,
-    sig_map: SigMap,
-    seen: Arc<AtomicUsize>,
-    done: Arc<AtomicBool>,
-    shutdown_tx: broadcast::Sender<()>,
-    mut shutdown_rx: broadcast::Receiver<()>,
-) {
-    use prost::Message;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let mut stream = match tokio::net::TcpStream::connect(&url).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[{name}] TCP connect failed to {url}: {e}");
-            return;
-        }
-    };
-    let _ = stream.set_nodelay(true);
-
-    let req = soda::stream::SubscribeRequest {
-        dex_protocols: vec![soda::stream::DexProtocol::PumpAmm as i32],
-        program_ids: vec![],
-        token_addresses: vec![],
-        pool_addresses: vec![],
-        event_types: vec![soda::stream::EventType::Trade as i32],
-    };
-    let mut req_buf = Vec::new();
-    req.encode(&mut req_buf).unwrap();
-    let len = req_buf.len() as u32;
-    stream.write_all(&len.to_le_bytes()).await.unwrap();
-    stream.write_all(&req_buf).await.unwrap();
-
-    eprintln!("[{name}] subscribed (raw TCP)");
-
-    let mut len_buf = [0u8; 4];
-    let mut msg_buf = vec![0u8; 65536];
-
-    loop {
-        tokio::select! {
-            result = stream.read_exact(&mut len_buf) => {
-                match result {
-                    Ok(_) => {
-                        let msg_len = u32::from_le_bytes(len_buf) as usize;
-                        if msg_len > msg_buf.len() {
-                            msg_buf.resize(msg_len, 0);
-                        }
-                        if let Err(e) = stream.read_exact(&mut msg_buf[..msg_len]).await {
-                            eprintln!("[{name}] read error: {e}");
-                            return;
-                        }
-                        if let Ok(event) = soda::stream::TokenEvent::decode(&msg_buf[..msg_len]) {
-                            if let Some(trade) = &event.trade {
-                                if !trade.tx_hash.is_empty() {
-                                    record_signature(&sig_map, &seen, &done, &shutdown_tx, &name, idx, target, num_endpoints, &trade.tx_hash);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[{name}] connection closed: {e}");
-                        return;
-                    }
                 }
             }
             _ = shutdown_rx.recv() => return,

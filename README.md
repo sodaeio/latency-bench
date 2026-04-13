@@ -11,7 +11,6 @@ Compare latency across Solana streaming endpoints side-by-side. Subscribes to mu
 | `:quic` | QUIC | Richat QUIC transport |
 | `:soda` | Soda gRPC | Soda stream service (protobuf/gRPC) |
 | `:sodaws` | Soda WebSocket | Soda stream service (WebSocket) |
-| `:sodatcp` | Soda TCP | Soda stream service (raw TCP) |
 
 ## Build
 
