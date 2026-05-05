@@ -29,6 +29,8 @@ pub mod shredstream {
     include!(concat!(env!("OUT_DIR"), "/shredstream.rs"));
 }
 
+mod shred;
+
 pub mod richat {
     include!(concat!(env!("OUT_DIR"), "/richat.rs"));
 }
@@ -50,13 +52,24 @@ use geyser::{SubscribeRequest, SubscribeRequestFilterTransactions, subscribe_upd
 struct Args {
     /// Endpoints as name=url pairs with optional protocol suffix.
     ///
-    /// Supported suffixes: :shredstream, :quic, :soda, :sodaws, :sodatcp.
+    /// Supported suffixes: :shredstream, :quic, :soda, :sodaws, :udp.
     /// No suffix implies Yellowstone-compatible gRPC (geyser proto).
+    ///
+    /// :udp binds a UDP socket and parses raw turbine shreds (shredwatch-style).
+    /// The URL is BIND_IP:PORT. Latency is attributed per signature via the
+    /// slot the gRPC sources report — UDP "wins" for a tx if it saw any shred
+    /// of that tx's slot before the gRPC stream delivered the tx itself.
+    ///
+    /// :pcap captures shreds via AF_PACKET on Linux without binding the port
+    /// (works alongside the validator). URL is [SRC_IP@]IFACE:PORT. Requires
+    /// CAP_NET_RAW (e.g. `sudo setcap cap_net_raw=eip latency-bench`).
     ///
     /// Examples:
     ///   richat=http://localhost:10200
     ///   shredpath=http://host:9090:shredstream
     ///   richat-quic=host:10101:quic
+    ///   turbine=0.0.0.0:8001:udp
+    ///   shredpath-port=45.154.33.82@bond0:10002:pcap
     #[arg(short, long, required = true, num_args = 1..)]
     endpoint: Vec<String>,
 
@@ -80,6 +93,8 @@ enum EndpointKind {
     Quic,
     Soda,
     SodaWs,
+    Udp,
+    Pcap,
 }
 
 struct EndpointConfig {
@@ -89,12 +104,16 @@ struct EndpointConfig {
 }
 
 type SigMap = Arc<Mutex<HashMap<String, Vec<(usize, Instant)>>>>;
+type SigSlotMap = Arc<Mutex<HashMap<String, u64>>>;
+type SlotFirstSeen = Arc<Mutex<HashMap<u64, Instant>>>;
 
 const SUFFIX_MAP: &[(&str, EndpointKind)] = &[
     (":sodaws", EndpointKind::SodaWs),
     (":soda", EndpointKind::Soda),
     (":shredstream", EndpointKind::Shredstream),
     (":quic", EndpointKind::Quic),
+    (":udp", EndpointKind::Udp),
+    (":pcap", EndpointKind::Pcap),
 ];
 
 fn parse_endpoint(s: &str) -> EndpointConfig {
@@ -130,15 +149,33 @@ async fn main() -> Result<()> {
     let num_endpoints = endpoints.len();
 
     let sig_map: SigMap = Arc::new(Mutex::new(HashMap::new()));
+    let sig_slot: SigSlotMap = Arc::new(Mutex::new(HashMap::new()));
+    // Per-endpoint slot_first_seen — populated only for UDP endpoints.
+    let slot_maps: Vec<Option<SlotFirstSeen>> = endpoints
+        .iter()
+        .map(|ep| match ep.kind {
+            EndpointKind::Udp | EndpointKind::Pcap => Some(Arc::new(Mutex::new(HashMap::new()))),
+            _ => None,
+        })
+        .collect();
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
     let target = args.transactions;
     let seen = Arc::new(AtomicUsize::new(0));
     let done = Arc::new(AtomicBool::new(false));
 
+    // UDP/pcap sources can't push signatures themselves — they only know slots.
+    // Target completion is driven by the live (non-shred) endpoints.
+    let live_endpoints = endpoints
+        .iter()
+        .filter(|e| e.kind != EndpointKind::Udp && e.kind != EndpointKind::Pcap)
+        .count()
+        .max(1);
+
     let mut handles = Vec::new();
 
     for (idx, ep) in endpoints.iter().enumerate() {
         let sig_map = sig_map.clone();
+        let sig_slot = sig_slot.clone();
         let shutdown_rx = shutdown_tx.subscribe();
         let seen = seen.clone();
         let done = done.clone();
@@ -147,6 +184,7 @@ async fn main() -> Result<()> {
         let name = ep.name.clone();
         let account = args.account.clone();
         let kind = ep.kind.clone();
+        let slot_map = slot_maps[idx].clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("bench-{name}"))
@@ -158,19 +196,25 @@ async fn main() -> Result<()> {
                 rt.block_on(async move {
                     match kind {
                         EndpointKind::Yellowstone => {
-                            run_yellowstone(idx, name, url, account, target, num_endpoints, sig_map, seen, done, shutdown_tx, shutdown_rx).await;
+                            run_yellowstone(idx, name, url, account, target, live_endpoints, sig_map, sig_slot, seen, done, shutdown_tx, shutdown_rx).await;
                         }
                         EndpointKind::Shredstream => {
-                            run_shredstream(idx, name, url, account, target, num_endpoints, sig_map, seen, done, shutdown_tx, shutdown_rx).await;
+                            run_shredstream(idx, name, url, account, target, live_endpoints, sig_map, sig_slot, seen, done, shutdown_tx, shutdown_rx).await;
                         }
                         EndpointKind::Quic => {
-                            run_quic(idx, name, url, account, target, num_endpoints, sig_map, seen, done, shutdown_tx, shutdown_rx).await;
+                            run_quic(idx, name, url, account, target, live_endpoints, sig_map, sig_slot, seen, done, shutdown_tx, shutdown_rx).await;
                         }
                         EndpointKind::Soda => {
-                            run_soda(idx, name, url, target, num_endpoints, sig_map, seen, done, shutdown_tx, shutdown_rx).await;
+                            run_soda(idx, name, url, target, live_endpoints, sig_map, seen, done, shutdown_tx, shutdown_rx).await;
                         }
                         EndpointKind::SodaWs => {
-                            run_soda_ws(idx, name, url, account, target, num_endpoints, sig_map, seen, done, shutdown_tx, shutdown_rx).await;
+                            run_soda_ws(idx, name, url, account, target, live_endpoints, sig_map, seen, done, shutdown_tx, shutdown_rx).await;
+                        }
+                        EndpointKind::Udp => {
+                            run_udp(name, url, slot_map.expect("udp slot_map"), shutdown_rx).await;
+                        }
+                        EndpointKind::Pcap => {
+                            run_pcap(name, url, slot_map.expect("pcap slot_map"), shutdown_rx).await;
                         }
                     }
                 });
@@ -187,6 +231,32 @@ async fn main() -> Result<()> {
     }
     let _ = shutdown_tx.send(());
     std::thread::sleep(Duration::from_millis(500));
+
+    // Inject UDP arrivals: for each tx whose slot we know, attribute the UDP
+    // endpoint's timestamp as the first time we saw any shred of that slot.
+    {
+        let slot_lookup = sig_slot.lock().unwrap();
+        let mut map = sig_map.lock().unwrap();
+        for (udp_idx, slot_map) in slot_maps.iter().enumerate() {
+            let Some(slot_map) = slot_map else { continue };
+            let slot_seen = slot_map.lock().unwrap();
+            let mut hits = 0usize;
+            for (sig, slot) in slot_lookup.iter() {
+                if let Some(t) = slot_seen.get(slot) {
+                    let entry = map.entry(sig.clone()).or_default();
+                    if !entry.iter().any(|(i, _)| *i == udp_idx) {
+                        entry.push((udp_idx, *t));
+                        hits += 1;
+                    }
+                }
+            }
+            eprintln!(
+                "[{}] attributed {hits} txs from {} slots seen on UDP",
+                endpoints[udp_idx].name,
+                slot_seen.len(),
+            );
+        }
+    }
 
     // Analyze
     let map = sig_map.lock().unwrap();
@@ -543,6 +613,7 @@ async fn run_yellowstone(
     target: usize,
     num_endpoints: usize,
     sig_map: SigMap,
+    sig_slot: SigSlotMap,
     seen: Arc<AtomicUsize>,
     done: Arc<AtomicBool>,
     shutdown_tx: broadcast::Sender<()>,
@@ -601,8 +672,10 @@ async fn run_yellowstone(
                 match msg {
                     Some(Ok(update)) => {
                         if let Some(UpdateOneof::Transaction(tx)) = update.update_oneof {
+                            let slot = tx.slot;
                             if let Some(tx_inner) = &tx.transaction {
                                 let sig = bs58::encode(&tx_inner.signature).into_string();
+                                sig_slot.lock().unwrap().entry(sig.clone()).or_insert(slot);
                                 record_signature(&sig_map, &seen, &done, &shutdown_tx, &name, idx, target, num_endpoints, &sig);
                             }
                         }
@@ -624,6 +697,7 @@ async fn run_shredstream(
     target: usize,
     num_endpoints: usize,
     sig_map: SigMap,
+    sig_slot: SigSlotMap,
     seen: Arc<AtomicUsize>,
     done: Arc<AtomicBool>,
     shutdown_tx: broadcast::Sender<()>,
@@ -662,6 +736,7 @@ async fn run_shredstream(
             msg = stream.next() => {
                 match msg {
                     Some(Ok(slot_entry)) => {
+                        let slot = slot_entry.slot;
                         let entries: Vec<solana_entry::entry::Entry> = match bincode::deserialize(&slot_entry.entries) {
                             Ok(e) => e,
                             Err(e) => {
@@ -673,6 +748,7 @@ async fn run_shredstream(
                             for tx in entry.transactions {
                                 if tx.message.static_account_keys().iter().any(|k| k == &account_pubkey) {
                                     let sig = tx.signatures[0].to_string();
+                                    sig_slot.lock().unwrap().entry(sig.clone()).or_insert(slot);
                                     record_signature(&sig_map, &seen, &done, &shutdown_tx, &name, idx, target, num_endpoints, &sig);
                                 }
                             }
@@ -694,6 +770,7 @@ async fn run_quic(
     target: usize,
     num_endpoints: usize,
     sig_map: SigMap,
+    sig_slot: SigSlotMap,
     seen: Arc<AtomicUsize>,
     done: Arc<AtomicBool>,
     shutdown_tx: broadcast::Sender<()>,
@@ -884,6 +961,7 @@ async fn run_quic(
                 };
 
                 if let Some(UpdateOneof::Transaction(tx)) = update.update_oneof {
+                    let slot = tx.slot;
                     if let Some(tx_inner) = &tx.transaction {
                         if let Some(tx_msg) = &tx_inner.transaction {
                             if let Some(msg) = &tx_msg.message {
@@ -893,6 +971,7 @@ async fn run_quic(
                             }
                         }
                         let sig = bs58::encode(&tx_inner.signature).into_string();
+                        sig_slot.lock().unwrap().entry(sig.clone()).or_insert(slot);
                         record_signature(&sig_map, &seen, &done, &shutdown_tx, &name, idx, target, num_endpoints, &sig);
                     }
                 }
@@ -1036,6 +1115,400 @@ async fn run_soda_ws(
             _ = shutdown_rx.recv() => return,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// UDP shred capture (shredwatch-style)
+// ---------------------------------------------------------------------------
+
+async fn run_udp(
+    name: String,
+    url: String,
+    slot_first_seen: SlotFirstSeen,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::net::{SocketAddr, ToSocketAddrs};
+
+    let bind_addr: SocketAddr = match url.to_socket_addrs() {
+        Ok(mut a) => match a.next() {
+            Some(a) => a,
+            None => {
+                eprintln!("[{name}] failed to resolve bind addr: {url}");
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!("[{name}] resolve error: {e}");
+            return;
+        }
+    };
+
+    let domain = if bind_addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let sock = match Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[{name}] socket() failed: {e}");
+            return;
+        }
+    };
+    let _ = sock.set_recv_buffer_size(8 * 1024 * 1024);
+    let _ = sock.set_reuse_address(true);
+    let _ = sock.set_nonblocking(true);
+    if let Err(e) = sock.bind(&bind_addr.into()) {
+        eprintln!("[{name}] bind {bind_addr} failed: {e}");
+        return;
+    }
+
+    let std_sock: std::net::UdpSocket = sock.into();
+    let udp = match tokio::net::UdpSocket::from_std(std_sock) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[{name}] tokio adopt failed: {e}");
+            return;
+        }
+    };
+
+    eprintln!("[{name}] listening for shreds on {bind_addr}");
+
+    let mut buf = vec![0u8; 2048];
+    let mut shreds_seen: u64 = 0;
+    let mut slots_seen: u64 = 0;
+
+    loop {
+        tokio::select! { biased;
+            _ = shutdown_rx.recv() => {
+                eprintln!("[{name}] stopped after {shreds_seen} shreds across {slots_seen} slots");
+                return;
+            }
+            r = udp.recv_from(&mut buf) => {
+                let n = match r {
+                    Ok((n, _)) => n,
+                    Err(e) => {
+                        eprintln!("[{name}] recv error: {e}");
+                        continue;
+                    }
+                };
+                let now = Instant::now();
+                let Some(key) = shred::parse(&buf[..n]) else { continue };
+                shreds_seen += 1;
+                let mut map = slot_first_seen.lock().unwrap();
+                let std::collections::hash_map::Entry::Vacant(slot) = map.entry(key.slot) else {
+                    continue;
+                };
+                slot.insert(now);
+                slots_seen += 1;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AF_PACKET shred capture (Linux)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+async fn run_pcap(
+    name: String,
+    url: String,
+    slot_first_seen: SlotFirstSeen,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) {
+    use std::net::Ipv4Addr;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::sync::atomic::AtomicBool;
+
+    // Parse URL: [SRC_IP@]IFACE:PORT
+    let (src_ip, iface_port) = match url.split_once('@') {
+        Some((ip, rest)) => match ip.parse::<Ipv4Addr>() {
+            Ok(a) => (Some(a), rest.to_string()),
+            Err(e) => {
+                eprintln!("[{name}] bad src ip {ip}: {e}");
+                return;
+            }
+        },
+        None => (None, url.clone()),
+    };
+    let (iface, port_str) = match iface_port.rsplit_once(':') {
+        Some(p) => p,
+        None => {
+            eprintln!("[{name}] bad pcap url: {url} (expected [SRC@]IFACE:PORT)");
+            return;
+        }
+    };
+    let port: u16 = match port_str.parse() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[{name}] bad port {port_str}: {e}");
+            return;
+        }
+    };
+    let iface = iface.to_string();
+
+    // Open AF_PACKET socket
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            (libc::ETH_P_IP as u16).to_be() as i32,
+        )
+    };
+    if fd < 0 {
+        eprintln!(
+            "[{name}] AF_PACKET socket failed: {} (need CAP_NET_RAW; try `sudo setcap cap_net_raw=eip <bin>`)",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    let owned: OwnedFd = unsafe { OwnedFd::from_raw_fd(fd) };
+
+    // Increase RX buffer (best effort)
+    let bufsz: i32 = 32 * 1024 * 1024;
+    unsafe {
+        libc::setsockopt(
+            owned.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUFFORCE,
+            &bufsz as *const _ as *const _,
+            std::mem::size_of_val(&bufsz) as u32,
+        );
+    }
+
+    // 100ms recv timeout so the blocking thread can check shutdown periodically.
+    let tv = libc::timeval { tv_sec: 0, tv_usec: 100_000 };
+    unsafe {
+        libc::setsockopt(
+            owned.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &tv as *const _ as *const _,
+            std::mem::size_of_val(&tv) as u32,
+        );
+    }
+
+    // Resolve interface index for SO_BINDTODEVICE-style scoping via sockaddr_ll
+    let if_index = match if_nametoindex(&iface) {
+        Some(i) => i,
+        None => {
+            eprintln!("[{name}] interface {iface} not found");
+            return;
+        }
+    };
+    let sll = libc::sockaddr_ll {
+        sll_family: libc::AF_PACKET as u16,
+        sll_protocol: (libc::ETH_P_IP as u16).to_be(),
+        sll_ifindex: if_index as i32,
+        sll_hatype: 0,
+        sll_pkttype: 0,
+        sll_halen: 0,
+        sll_addr: [0; 8],
+    };
+    let bind_rc = unsafe {
+        libc::bind(
+            owned.as_raw_fd(),
+            &sll as *const _ as *const _,
+            std::mem::size_of::<libc::sockaddr_ll>() as u32,
+        )
+    };
+    if bind_rc < 0 {
+        eprintln!(
+            "[{name}] bind to {iface} failed: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+
+    // Build & attach BPF filter (UDP dst port [+ optional src IP])
+    let prog = build_bpf(port, src_ip);
+    let fprog = SockFprog {
+        len: prog.len() as u16,
+        filter: prog.as_ptr(),
+    };
+    let attach_rc = unsafe {
+        libc::setsockopt(
+            owned.as_raw_fd(),
+            libc::SOL_SOCKET,
+            SO_ATTACH_FILTER,
+            &fprog as *const _ as *const _,
+            std::mem::size_of::<SockFprog>() as u32,
+        )
+    };
+    if attach_rc < 0 {
+        eprintln!(
+            "[{name}] SO_ATTACH_FILTER failed: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+
+    eprintln!(
+        "[{name}] AF_PACKET on {iface}, filter: udp dst port {port}{}",
+        src_ip.map(|i| format!(" src {i}")).unwrap_or_default()
+    );
+
+    // Shutdown bridge: tokio task flips a bool the blocking thread checks.
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_signal = stop.clone();
+    tokio::spawn(async move {
+        let _ = shutdown_rx.recv().await;
+        stop_signal.store(true, Ordering::Release);
+    });
+
+    let raw_fd = owned.as_raw_fd();
+    let name_for_thread = name.clone();
+    let join = tokio::task::spawn_blocking(move || {
+        let _keep_alive = owned; // OwnedFd lives until this thread returns
+        let mut buf = vec![0u8; 2048];
+        let mut shreds: u64 = 0;
+        let mut slots: u64 = 0;
+        loop {
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            let n = unsafe {
+                libc::recv(raw_fd, buf.as_mut_ptr() as *mut _, buf.len(), 0)
+            };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                let kind = err.kind();
+                if matches!(kind, std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) {
+                    continue;
+                }
+                if err.raw_os_error() == Some(libc::EAGAIN) {
+                    continue;
+                }
+                eprintln!("[{name_for_thread}] recv error: {err}");
+                break;
+            }
+            let now = Instant::now();
+            let frame = &buf[..n as usize];
+            let Some(payload) = strip_eth_ip_udp(frame) else { continue };
+            let Some(key) = shred::parse(payload) else { continue };
+            shreds += 1;
+            let mut map = slot_first_seen.lock().unwrap();
+            if let std::collections::hash_map::Entry::Vacant(e) = map.entry(key.slot) {
+                e.insert(now);
+                slots += 1;
+            }
+        }
+        (shreds, slots)
+    });
+
+    let (shreds, slots) = match join.await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[{name}] join error: {e}");
+            (0, 0)
+        }
+    };
+    eprintln!("[{name}] stopped after {shreds} shreds across {slots} slots");
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_pcap(
+    name: String,
+    _url: String,
+    _slot_first_seen: SlotFirstSeen,
+    _shutdown_rx: broadcast::Receiver<()>,
+) {
+    eprintln!("[{name}] :pcap is Linux-only");
+}
+
+// Strip Ethernet (14) + variable IPv4 + UDP (8) and return the UDP payload.
+#[cfg(target_os = "linux")]
+fn strip_eth_ip_udp(frame: &[u8]) -> Option<&[u8]> {
+    if frame.len() < 14 + 20 + 8 { return None; }
+    let ihl = (frame[14] & 0x0f) as usize * 4;
+    if ihl < 20 { return None; }
+    let udp_off = 14 + ihl;
+    if frame.len() < udp_off + 8 { return None; }
+    Some(&frame[udp_off + 8..])
+}
+
+#[cfg(target_os = "linux")]
+fn if_nametoindex(name: &str) -> Option<u32> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+    if idx == 0 { None } else { Some(idx) }
+}
+
+// Minimal classic-BPF builder. Layout matches the cBPF emitted for
+//   `udp and dst port PORT [and src host SRC]`.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SockFilter { code: u16, jt: u8, jf: u8, k: u32 }
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct SockFprog { len: u16, filter: *const SockFilter }
+
+#[cfg(target_os = "linux")]
+const SO_ATTACH_FILTER: i32 = 26;
+
+#[cfg(target_os = "linux")]
+fn build_bpf(port: u16, src_ip: Option<std::net::Ipv4Addr>) -> Vec<SockFilter> {
+    // BPF opcodes
+    const LDH_ABS: u16 = 0x28;  // ld halfword absolute
+    const LDB_ABS: u16 = 0x30;  // ld byte absolute
+    const LDW_ABS: u16 = 0x20;  // ld word absolute
+    const LDX_MSH: u16 = 0xb1;  // X = 4 * (P[k] & 0xf)
+    const LDH_IND: u16 = 0x48;  // ld halfword from X+k
+    const JEQ_K:   u16 = 0x15;  // if A == k
+    const JSET_K:  u16 = 0x45;  // if A & k
+    const RET_K:   u16 = 0x06;  // ret k
+
+    let port = port as u32;
+    let mut p: Vec<SockFilter> = Vec::new();
+    let push = |p: &mut Vec<SockFilter>, code, jt, jf, k| p.push(SockFilter { code, jt, jf, k });
+
+    // i=0  ldh [12]              ; ethertype
+    push(&mut p, LDH_ABS, 0, 0, 12);
+    // i=1  jeq #0x0800 -> next, else DROP
+    let i1 = p.len();
+    push(&mut p, JEQ_K, 0, 0, 0x0800);
+    // i=2  ldb [23]               ; ip proto
+    push(&mut p, LDB_ABS, 0, 0, 23);
+    // i=3  jeq #17 -> next, else DROP
+    let i3 = p.len();
+    push(&mut p, JEQ_K, 0, 0, 17);
+    // optional src ip filter
+    let i_src = if let Some(ip) = src_ip {
+        push(&mut p, LDW_ABS, 0, 0, 26);
+        let i = p.len();
+        push(&mut p, JEQ_K, 0, 0, u32::from(ip));
+        Some(i)
+    } else { None };
+    // ldh [20]; jset #0x1fff (fragment) -> DROP
+    push(&mut p, LDH_ABS, 0, 0, 20);
+    let i_frag = p.len();
+    push(&mut p, JSET_K, 0, 0, 0x1fff);
+    // ldxb 4*([14]&0xf); ldh [x+16]
+    push(&mut p, LDX_MSH, 0, 0, 14);
+    push(&mut p, LDH_IND, 0, 0, 16);
+    // jeq #PORT -> ACCEPT, else DROP
+    let i_port = p.len();
+    push(&mut p, JEQ_K, 0, 0, port);
+    // ACCEPT
+    let accept_idx = p.len();
+    push(&mut p, RET_K, 0, 0, 0xffff);
+    // DROP
+    let drop_idx = p.len();
+    push(&mut p, RET_K, 0, 0, 0);
+
+    let set_jf = |p: &mut Vec<SockFilter>, idx: usize, target: usize| {
+        p[idx].jf = (target - idx - 1) as u8;
+    };
+    let set_jt = |p: &mut Vec<SockFilter>, idx: usize, target: usize| {
+        p[idx].jt = (target - idx - 1) as u8;
+    };
+    set_jf(&mut p, i1, drop_idx);
+    set_jf(&mut p, i3, drop_idx);
+    if let Some(i) = i_src { set_jf(&mut p, i, drop_idx); }
+    set_jt(&mut p, i_frag, drop_idx);          // jset: branch if matched (fragment) -> drop
+    set_jt(&mut p, i_port, accept_idx);
+    set_jf(&mut p, i_port, drop_idx);
+    p
 }
 
 // ---------------------------------------------------------------------------
