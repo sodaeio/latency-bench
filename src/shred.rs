@@ -13,19 +13,16 @@ pub const MIN_SHRED_SIZE: usize = 83;
 const VARIANT_LEGACY_DATA: u8 = 0xA5;
 const VARIANT_LEGACY_CODE: u8 = 0x5A;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ShredType {
     Data,
     Code,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ShredKey {
     pub slot: u64,
-    // Kept for future shred-by-shred matching (cross-source dedup).
-    #[allow(dead_code)]
     pub index: u32,
-    #[allow(dead_code)]
     pub shred_type: ShredType,
 }
 

@@ -105,7 +105,29 @@ struct EndpointConfig {
 
 type SigMap = Arc<Mutex<HashMap<String, Vec<(usize, Instant)>>>>;
 type SigSlotMap = Arc<Mutex<HashMap<String, u64>>>;
-type SlotFirstSeen = Arc<Mutex<HashMap<u64, Instant>>>;
+// Shred capture state per shred source: slot-first-seen (for the gRPC bridge)
+// and per-shred-first-seen (for shreds-only matching).
+struct ShredCapture {
+    slot_first_seen: Mutex<HashMap<u64, Instant>>,
+    shred_first_seen: Mutex<HashMap<shred::ShredKey, Instant>>,
+}
+
+impl ShredCapture {
+    fn new() -> Self {
+        Self {
+            slot_first_seen: Mutex::new(HashMap::new()),
+            shred_first_seen: Mutex::new(HashMap::new()),
+        }
+    }
+    fn record(&self, key: shred::ShredKey, t: Instant) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.shred_first_seen.lock().unwrap().entry(key) {
+            e.insert(t);
+        }
+        if let std::collections::hash_map::Entry::Vacant(e) = self.slot_first_seen.lock().unwrap().entry(key.slot) {
+            e.insert(t);
+        }
+    }
+}
 
 const SUFFIX_MAP: &[(&str, EndpointKind)] = &[
     (":sodaws", EndpointKind::SodaWs),
@@ -151,10 +173,10 @@ async fn main() -> Result<()> {
     let sig_map: SigMap = Arc::new(Mutex::new(HashMap::new()));
     let sig_slot: SigSlotMap = Arc::new(Mutex::new(HashMap::new()));
     // Per-endpoint slot_first_seen — populated only for UDP endpoints.
-    let slot_maps: Vec<Option<SlotFirstSeen>> = endpoints
+    let captures: Vec<Option<Arc<ShredCapture>>> = endpoints
         .iter()
         .map(|ep| match ep.kind {
-            EndpointKind::Udp | EndpointKind::Pcap => Some(Arc::new(Mutex::new(HashMap::new()))),
+            EndpointKind::Udp | EndpointKind::Pcap => Some(Arc::new(ShredCapture::new())),
             _ => None,
         })
         .collect();
@@ -164,12 +186,14 @@ async fn main() -> Result<()> {
     let done = Arc::new(AtomicBool::new(false));
 
     // UDP/pcap sources can't push signatures themselves — they only know slots.
-    // Target completion is driven by the live (non-shred) endpoints.
+    // Target completion is driven by the live (non-shred) endpoints. If all
+    // sources are shreds, shreds-only mode runs after a fixed time window.
     let live_endpoints = endpoints
         .iter()
         .filter(|e| e.kind != EndpointKind::Udp && e.kind != EndpointKind::Pcap)
-        .count()
-        .max(1);
+        .count();
+    let shreds_only_run = live_endpoints == 0;
+    let live_endpoints = live_endpoints.max(1);
 
     let mut handles = Vec::new();
 
@@ -184,7 +208,7 @@ async fn main() -> Result<()> {
         let name = ep.name.clone();
         let account = args.account.clone();
         let kind = ep.kind.clone();
-        let slot_map = slot_maps[idx].clone();
+        let capture = captures[idx].clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("bench-{name}"))
@@ -211,10 +235,10 @@ async fn main() -> Result<()> {
                             run_soda_ws(idx, name, url, account, target, live_endpoints, sig_map, seen, done, shutdown_tx, shutdown_rx).await;
                         }
                         EndpointKind::Udp => {
-                            run_udp(name, url, slot_map.expect("udp slot_map"), shutdown_rx).await;
+                            run_udp(name, url, capture.expect("udp capture"), shutdown_rx).await;
                         }
                         EndpointKind::Pcap => {
-                            run_pcap(name, url, slot_map.expect("pcap slot_map"), shutdown_rx).await;
+                            run_pcap(name, url, capture.expect("pcap capture"), shutdown_rx).await;
                         }
                     }
                 });
@@ -223,8 +247,20 @@ async fn main() -> Result<()> {
         handles.push(handle);
     }
 
+    let start = Instant::now();
+    let shreds_only_window = Duration::from_secs(args.transactions.min(300) as u64);
+    if shreds_only_run {
+        eprintln!(
+            "[shreds-only] capturing for {}s (use -t <seconds> to override; capped at 300)",
+            shreds_only_window.as_secs()
+        );
+    }
     loop {
-        if handles.iter().any(|h| h.is_finished()) {
+        if shreds_only_run {
+            if start.elapsed() >= shreds_only_window {
+                break;
+            }
+        } else if handles.iter().any(|h| h.is_finished()) {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -232,27 +268,66 @@ async fn main() -> Result<()> {
     let _ = shutdown_tx.send(());
     std::thread::sleep(Duration::from_millis(500));
 
-    // Inject UDP arrivals: for each tx whose slot we know, attribute the UDP
-    // endpoint's timestamp as the first time we saw any shred of that slot.
+    // Shreds-only mode: no gRPC sources, ≥2 shred sources. Match by ShredKey.
+    let shred_indices: Vec<usize> = (0..num_endpoints)
+        .filter(|i| captures[*i].is_some())
+        .collect();
+
+    if shreds_only_run && shred_indices.len() >= 2 {
+        // Build a synthetic per-shred map keyed by ShredKey, reusing the
+        // existing analysis pipeline by stringifying the key.
+        let mut shred_map: HashMap<String, Vec<(usize, Instant)>> = HashMap::new();
+        for &idx in &shred_indices {
+            let cap = captures[idx].as_ref().unwrap();
+            let m = cap.shred_first_seen.lock().unwrap();
+            for (k, t) in m.iter() {
+                let key = format!("{}/{}/{:?}", k.slot, k.index, k.shred_type);
+                shred_map.entry(key).or_default().push((idx, *t));
+            }
+            eprintln!("[{}] {} shreds captured", endpoints[idx].name, m.len());
+        }
+        let matched = shred_map.values().filter(|v| v.len() >= 2).count();
+        let mut deltas: Vec<Vec<f64>> = vec![Vec::new(); num_endpoints];
+        let mut wins = vec![0usize; num_endpoints];
+        for arrivals in shred_map.values() {
+            if arrivals.len() < 2 { continue; }
+            let earliest = arrivals.iter().map(|(_, t)| *t).min().unwrap();
+            for (idx, time) in arrivals {
+                deltas[*idx].push(time.duration_since(earliest).as_secs_f64() * 1_000.0);
+            }
+            for (idx, time) in arrivals {
+                if *time == earliest {
+                    wins[*idx] += 1;
+                    break;
+                }
+            }
+        }
+        eprintln!("[shreds-only] matched {matched} shreds across {} sources", shred_indices.len());
+        print_report(&endpoints, &shred_map, &deltas, &wins, matched, num_endpoints);
+        return Ok(());
+    }
+
+    // Inject shred-source arrivals: for each tx whose slot we know, attribute
+    // the shred source's timestamp as the first time we saw any shred of that slot.
     {
         let slot_lookup = sig_slot.lock().unwrap();
         let mut map = sig_map.lock().unwrap();
-        for (udp_idx, slot_map) in slot_maps.iter().enumerate() {
-            let Some(slot_map) = slot_map else { continue };
-            let slot_seen = slot_map.lock().unwrap();
+        for (idx, cap) in captures.iter().enumerate() {
+            let Some(cap) = cap else { continue };
+            let slot_seen = cap.slot_first_seen.lock().unwrap();
             let mut hits = 0usize;
             for (sig, slot) in slot_lookup.iter() {
                 if let Some(t) = slot_seen.get(slot) {
                     let entry = map.entry(sig.clone()).or_default();
-                    if !entry.iter().any(|(i, _)| *i == udp_idx) {
-                        entry.push((udp_idx, *t));
+                    if !entry.iter().any(|(i, _)| *i == idx) {
+                        entry.push((idx, *t));
                         hits += 1;
                     }
                 }
             }
             eprintln!(
                 "[{}] attributed {hits} txs from {} slots seen on UDP",
-                endpoints[udp_idx].name,
+                endpoints[idx].name,
                 slot_seen.len(),
             );
         }
@@ -1124,7 +1199,7 @@ async fn run_soda_ws(
 async fn run_udp(
     name: String,
     url: String,
-    slot_first_seen: SlotFirstSeen,
+    capture: Arc<ShredCapture>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     use socket2::{Domain, Protocol, Socket, Type};
@@ -1192,12 +1267,11 @@ async fn run_udp(
                 let now = Instant::now();
                 let Some(key) = shred::parse(&buf[..n]) else { continue };
                 shreds_seen += 1;
-                let mut map = slot_first_seen.lock().unwrap();
-                let std::collections::hash_map::Entry::Vacant(slot) = map.entry(key.slot) else {
-                    continue;
-                };
-                slot.insert(now);
-                slots_seen += 1;
+                let was_new_slot = !capture.slot_first_seen.lock().unwrap().contains_key(&key.slot);
+                capture.record(key, now);
+                if was_new_slot {
+                    slots_seen += 1;
+                }
             }
         }
     }
@@ -1211,7 +1285,7 @@ async fn run_udp(
 async fn run_pcap(
     name: String,
     url: String,
-    slot_first_seen: SlotFirstSeen,
+    capture: Arc<ShredCapture>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     use std::net::Ipv4Addr;
@@ -1290,7 +1364,16 @@ async fn run_pcap(
     let if_index = match if_nametoindex(&iface) {
         Some(i) => i,
         None => {
-            eprintln!("[{name}] interface {iface} not found");
+            let hint = if iface.parse::<std::net::IpAddr>().is_ok() {
+                format!(
+                    " (looks like an IP — :pcap takes an interface name, not an IP. \
+                     Try `lo` for loopback, or your NIC name from `ip link`. \
+                     If you want to bind by IP, use :udp instead.)"
+                )
+            } else {
+                String::new()
+            };
+            eprintln!("[{name}] interface {iface} not found{hint}");
             return;
         }
     };
@@ -1385,9 +1468,9 @@ async fn run_pcap(
             let Some(payload) = strip_eth_ip_udp(frame) else { continue };
             let Some(key) = shred::parse(payload) else { continue };
             shreds += 1;
-            let mut map = slot_first_seen.lock().unwrap();
-            if let std::collections::hash_map::Entry::Vacant(e) = map.entry(key.slot) {
-                e.insert(now);
+            let was_new_slot = !capture.slot_first_seen.lock().unwrap().contains_key(&key.slot);
+            capture.record(key, now);
+            if was_new_slot {
                 slots += 1;
             }
         }
@@ -1408,7 +1491,7 @@ async fn run_pcap(
 async fn run_pcap(
     name: String,
     _url: String,
-    _slot_first_seen: SlotFirstSeen,
+    _capture: Arc<ShredCapture>,
     _shutdown_rx: broadcast::Receiver<()>,
 ) {
     eprintln!("[{name}] :pcap is Linux-only");
